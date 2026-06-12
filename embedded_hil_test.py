@@ -1,11 +1,15 @@
 """
 Advanced Embedded Hardware-in-the-Loop (HIL) Test Automation Framework
-Integrating PyVISA Instrument Control & Raspberry Pi GPIO.
+Integrating PyVISA, Raspberry Pi GPIO, and RTOS Concurrency Validations.
 """
+
+import warnings
+warnings.filterwarnings("ignore", message="Falling back from")
 
 import time
 import logging
 import random
+import threading
 import pyvisa
 
 try:
@@ -23,11 +27,16 @@ logger = logging.getLogger("DormakabaHIL")
 
 
 class UltimateHILController:
-    """Manages PyVISA Instruments (Oscilloscope) and Raspberry Pi GPIO Interfaces"""    
+    """Manages PyVISA Instruments, Raspberry Pi GPIO, and Shared Resource Mutexes"""
+    
     def __init__(self):
         self.is_hardware_pi = False
         self.scope = None
         
+        self.hardware_mutex = threading.Lock()  # Simulates MCU Mutex protecting the lock motor
+        self.log_semaphore = threading.Semaphore(2)  # Simulates an MCU Semaphore limiting log flash writes
+        self.shared_memory_bus = 0  # Represents a critical microcontroller data registry
+
         try:
             self.rm = pyvisa.ResourceManager('@sim')
             self.scope = self.rm.open_resource('ASRL1::INSTR')
@@ -53,10 +62,8 @@ class UltimateHILController:
     def setup_oscilloscope(self):
         """Configures the Oscilloscope using Standard SCPI commands via PyVISA"""
         if self.scope:
-            logger.info("PyVISA: Configuring Oscilloscope Timebase and Trigger Level...")
             self.scope.write(":AUToscale") 
             self.scope.write(":TRIGger:MODE EDGE")
-            
             idn = self.scope.query("*IDN?")
             logger.info(f"PyVISA Handshake Success. Instrument IDN: {idn.strip()}")
 
@@ -69,12 +76,10 @@ class UltimateHILController:
         time.sleep(0.01)  # Hold signal high for 10ms
         self.trigger_pin.off()
 
-        logger.info("HIL: Scraping Execution Timing Metrics...")
         if self.is_hardware_pi:
             start_time = time.time()
             pin_activated = self.response_pin.wait_for_active(timeout=0.5)
             measured_time_ms = (time.time() - start_time) * 1000
-            
             if not pin_activated:
                 raise TimeoutError("HIL CRITICAL CRASH: Lock relay hardware failed to switch state.")
         else:
@@ -83,35 +88,84 @@ class UltimateHILController:
         logger.info(f"METRIC CAPTURED: Physical Lock Activation Delay = {measured_time_ms} ms")
         return measured_time_ms
 
-def test_dormakaba_smart_lock_realtime_constraint():
-    """
-    Test Objective: Validate that the electronic lock motor clicks open within a strict
-    15.0ms window after processing the token to minimize power drain and transit delay.
-    """
-    logger.info("=========================================================")
-    logger.info("STARTING PYVISA + RASPBERRY PI MIXED HIL INTEGRATION TEST")
-    logger.info("=========================================================")
+    def simulate_concurrent_task(self, task_name, use_mutex=True):
+        """Simulates an incoming access request attempting to control the shared lock motor"""
+        logger.info(f"RTOS TASK: {task_name} is requesting control of the lock motor module...")
+        
+        if use_mutex:
+            with self.hardware_mutex:
+                logger.info(f"MUTEX ACQUIRED by {task_name}. Shared lock resource is now locked.")
+                
+                current_value = self.shared_memory_bus
+                time.sleep(0.05)  # Simulate active firmware execution delay
+                self.shared_memory_bus = current_value + 1
+                
+                logger.info(f"MUTEX RELEASED by {task_name}. Shared memory bus updated securely.")
+        else:
+            logger.warning(f"DANGER: {task_name} accessing memory registry without a Mutex lock!")
+            current_value = self.shared_memory_bus
+            time.sleep(0.05)
+            self.shared_memory_bus = current_value + 1
 
+def test_smart_lock_realtime_constraint():
+    """Track 1: Evaluates that the hardware loop satisfies its strict millisecond deadlines"""
+    logger.info("\n=== RUNNING TRACK 1: REAL-TIME CONSTRAINT VERIFICATION ===")
+    hil_framework = UltimateHILController()
+    latency_ms = hil_framework.run_automated_test_cycle()
+    
+    max_threshold_ms = 15.0
+    assert latency_ms < max_threshold_ms, f"TIMING VIOLATION: Execution delayed to {latency_ms}ms"
+    logger.info(f"TRACK 1 PASSED: Hardware timing is compliant ({latency_ms}ms < 15.0ms).")
+
+
+def test_rtos_mutex_protection_prevents_race_condition():
+    """Track 2: Simulates simultaneous RFID and BLE requests using safe Mutex locks"""
+    logger.info("\n=== RUNNING TRACK 2: RTOS MUTEX CONCURRENCY STRESS TEST ===")
+    hil_framework = UltimateHILController()
+    hil_framework.shared_memory_bus = 0
+
+    thread_rfid = threading.Thread(target=hil_framework.simulate_concurrent_task, args=("RFID_Task_Reader", True))
+    thread_ble = threading.Thread(target=hil_framework.simulate_concurrent_task, args=("BLE_Task_Receiver", True))
+
+    thread_rfid.start()
+    thread_ble.start()
+    thread_rfid.join()
+    thread_ble.join()
+
+    logger.info(f"Final Shared Memory Bus Value: {hil_framework.shared_memory_bus}")
+    assert hil_framework.shared_memory_bus == 2, "RTOS MUTEX CORRUPTION: Data step tracking failed."
+    logger.info("TRACK 2 PASSED: Mutex successfully synchronized tasks without data conflicts.")
+
+
+def test_rtos_semaphore_capacity_limits():
+    """Track 3: Verifies Counting Semaphores limit concurrent file system operations"""
+    logger.info("\n=== RUNNING TRACK 3: RTOS SEMAPHORE STRESS TEST ===")
     hil_framework = UltimateHILController()
     
-    latency_ms = hil_framework.run_automated_test_cycle()
-
-    max_threshold_ms = 15.0
-    assert latency_ms < max_threshold_ms, (
-        f"REAL-TIME CONSTRAINT VIOLATION: "
-        f"Latency was {latency_ms}ms (Max Allowed: {max_threshold_ms}ms)"
-    )
+    active_tokens = []
     
-    logger.info(f"ASSERTION SUCCESS: Hardware performance is within bounds ({latency_ms}ms < 15.0ms).")
-    logger.info("=========================================================")
-    logger.info("HIL TEST AUTOMATION STATUS: PASSED")
-    logger.info("=========================================================")
+    def worker_log_request(task_id):
+        acquired = hil_framework.log_semaphore.acquire(timeout=0.02)
+        if acquired:
+            active_tokens.append(task_id)
+            time.sleep(0.04) # Hold the logging channel resource
+            hil_framework.log_semaphore.release()
+        else:
+            logger.info(f"SEMAPHORE BLOCKED: Task_{task_id} safely queued or throttled by RTOS kernel.")
+
+    threads = [threading.Thread(target=worker_log_request, args=(i,)) for i in range(3)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    assert len(active_tokens) <= 2, "SEMAPHORE OVERFLOW: Microcontroller system register flooded!"
+    logger.info("TRACK 3 PASSED: Counting Semaphore throttled traffic boundaries properly.")
 
 
 if __name__ == "__main__":
     try:
-        test_dormakaba_smart_lock_realtime_constraint()
+        test_smart_lock_realtime_constraint()
+        test_rtos_mutex_protection_prevents_race_condition()
+        test_rtos_semaphore_capacity_limits()
+        print("\nALL EMBEDDED HIL & CONCURRENCY TEST CASES PASSED SUCCESSFULLY!")
     except AssertionError as error:
-        logger.error(f"TEST CASE FAILED: Performance Specification Failure -> {error}")
-    except Exception as error:
-        logger.error(f"TEST CASE CRASHED: Unexpected Automation Runtime Fault -> {error}")
+        logger.error(f"AUTOMATION FAILURE -> {error}")
